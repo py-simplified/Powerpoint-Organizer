@@ -1,0 +1,4 @@
+npm install pptxgenjs
+
+
+provide "new content information"

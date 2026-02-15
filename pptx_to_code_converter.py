@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+"""
+PowerPoint to PptxGenJS Code Converter
+A Streamlit app that analyzes PowerPoint slides and generates PptxGenJS code.
+"""
+
+import streamlit as st
+import zipfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+import tempfile
+import shutil
+from typing import Dict, List, Tuple, Optional
+import re
+
+# Constants
+EMU_TO_INCH = 914400  # 914400 EMUs = 1 inch
+
+# XML Namespaces
+NS = {
+    'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+    'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
+    'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+}
+
+class SlideElement:
+    """Represents a slide element (shape, text, image)."""
+    def __init__(self, element_type: str, properties: Dict):
+        self.element_type = element_type
+        self.properties = properties
+    
+    def to_pptxgenjs(self, slide_number: int = 1, filename: str = "presentation") -> str:
+        """Convert this element to PptxGenJS code."""
+        if self.element_type == 'text':
+            return self._generate_text_code()
+        elif self.element_type == 'shape':
+            return self._generate_shape_code()
+        elif self.element_type == 'image':
+            return self._generate_image_code(slide_number, filename)
+        return ""
+    
+    def _generate_text_code(self) -> str:
+        """Generate text element code."""
+        props = self.properties
+        
+        # Build options object
+        options = []
+        options.append(f"  x: {props.get('x', 0):.2f}, y: {props.get('y', 0):.2f}")
+        options.append(f"  w: {props.get('w', 1):.2f}, h: {props.get('h', 1):.2f}")
+        
+        if 'fontSize' in props:
+            options.append(f"  fontSize: {props['fontSize']}")
+        if 'fontFace' in props:
+            options.append(f"  fontFace: \"{props['fontFace']}\"")
+        if 'color' in props:
+            options.append(f"  color: \"{props['color']}\"")
+        if 'bold' in props and props['bold']:
+            options.append(f"  bold: true")
+        if 'italic' in props and props['italic']:
+            options.append(f"  italic: true")
+        if 'align' in props:
+            options.append(f"  align: \"{props['align']}\"")
+        if 'valign' in props:
+            options.append(f"  valign: \"{props['valign']}\"")
+        
+        text_content = props.get('text', '').replace('"', '\\"').replace('\n', '\\n')
+        
+        code = f"slide.addText(\"{text_content}\", {{\n"
+        code += ",\n".join(options)
+        code += "\n});"
+        
+        return code
+    
+    def _generate_shape_code(self) -> str:
+        """Generate shape element code."""
+        props = self.properties
+        
+        shape_type = props.get('shapeType', 'RECTANGLE')
+        
+        options = []
+        options.append(f"  x: {props.get('x', 0):.2f}, y: {props.get('y', 0):.2f}")
+        options.append(f"  w: {props.get('w', 1):.2f}, h: {props.get('h', 1):.2f}")
+        
+        if 'fillColor' in props:
+            options.append(f"  fill: {{ color: \"{props['fillColor']}\" }}")
+        if 'lineColor' in props:
+            line_width = props.get('lineWidth', 1)
+            options.append(f"  line: {{ color: \"{props['lineColor']}\", width: {line_width} }}")
+        
+        code = f"slide.addShape(pres.shapes.{shape_type}, {{\n"
+        code += ",\n".join(options)
+        code += "\n});"
+        
+        return code
+    
+    def _generate_image_code(self, slide_number: int = 1, filename: str = "presentation") -> str:
+        """Generate image element code with proper path to images folder."""
+        props = self.properties
+        
+        # Create unique image name: filename_slide#_img#.png
+        base_filename = filename.replace('.pptx', '').replace(' ', '_')
+        image_name = f"{base_filename}_slide{slide_number}_img{props.get('index', 1)}.png"
+        
+        options = []
+        options.append(f"  path: \"images/{image_name}\",  // Image will be saved in images/ folder")
+        options.append(f"  x: {props.get('x', 0):.2f}, y: {props.get('y', 0):.2f}")
+        options.append(f"  w: {props.get('w', 1):.2f}, h: {props.get('h', 1):.2f}")
+        
+        code = "slide.addImage({\n"
+        code += ",\n".join(options)
+        code += "\n});"
+        
+        return code
+
+
+class PPTXAnalyzer:
+    """Analyzes PowerPoint files and extracts slide information."""
+    
+    def __init__(self, pptx_path: str):
+        self.pptx_path = pptx_path
+        self.slide_count = 0
+        self._count_slides()
+    
+    def _count_slides(self):
+        """Count total slides in presentation."""
+        try:
+            with zipfile.ZipFile(self.pptx_path, 'r') as zip_ref:
+                slide_files = [f for f in zip_ref.namelist() if f.startswith('ppt/slides/slide') and f.endswith('.xml')]
+                self.slide_count = len(slide_files)
+        except Exception as e:
+            st.error(f"Error reading PowerPoint: {e}")
+            self.slide_count = 0
+    
+    def get_slide_count(self) -> int:
+        """Return total number of slides."""
+        return self.slide_count
+    
+    def extract_images(self, slide_number: int, output_dir: str, base_filename: str) -> List[str]:
+        """Extract all images from a specific slide to output directory."""
+        try:
+            with zipfile.ZipFile(self.pptx_path, 'r') as zip_ref:
+                # Read the slide XML
+                slide_xml_path = f'ppt/slides/slide{slide_number}.xml'
+                slide_xml = zip_ref.read(slide_xml_path)
+                root = ET.fromstring(slide_xml)
+                
+                # Read slide relationships to map image references
+                rels_path = f'ppt/slides/_rels/slide{slide_number}.xml.rels'
+                try:
+                    rels_xml = zip_ref.read(rels_path)
+                    rels_root = ET.fromstring(rels_xml)
+                except KeyError:
+                    return []  # No relationships = no images
+                
+                # Get all picture elements
+                pics = root.findall('.//p:pic', NS)
+                extracted_files = []
+                
+                for idx, pic in enumerate(pics, 1):
+                    # Find the relationship ID
+                    blip = pic.find('.//a:blip', NS)
+                    if blip is not None:
+                        embed_id = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+                        
+                        if embed_id:
+                            # Find the actual image path from relationships
+                            for rel in rels_root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
+                                if rel.get('Id') == embed_id:
+                                    image_path = rel.get('Target')
+                                    if image_path:
+                                        # Remove ../ prefix if present
+                                        image_path = image_path.replace('../', 'ppt/')
+                                        
+                                        try:
+                                            # Read image data
+                                            image_data = zip_ref.read(image_path)
+                                            
+                                            # Determine extension
+                                            ext = Path(image_path).suffix or '.png'
+                                            
+                                            # Create output filename
+                                            output_filename = f"{base_filename}_slide{slide_number}_img{idx}{ext}"
+                                            output_path = Path(output_dir) / output_filename
+                                            
+                                            # Write image file
+                                            with open(output_path, 'wb') as img_file:
+                                                img_file.write(image_data)
+                                            
+                                            extracted_files.append(output_filename)
+                                        except KeyError:
+                                            continue
+                
+                return extracted_files
+                
+        except Exception as e:
+            st.error(f"Error extracting images: {e}")
+            return []
+    
+    def analyze_slide(self, slide_number: int) -> Tuple[Optional[Dict], List[SlideElement]]:
+        """Analyze a specific slide and return background info and elements."""
+        try:
+            with zipfile.ZipFile(self.pptx_path, 'r') as zip_ref:
+                slide_xml_path = f'ppt/slides/slide{slide_number}.xml'
+                
+                try:
+                    slide_xml = zip_ref.read(slide_xml_path)
+                except KeyError:
+                    return None, []
+                
+                root = ET.fromstring(slide_xml)
+                
+                # Get background
+                background = self._extract_background(root)
+                
+                # Get all elements
+                elements = []
+                elements.extend(self._extract_shapes(root))
+                elements.extend(self._extract_images(root))
+                
+                return background, elements
+                
+        except Exception as e:
+            st.error(f"Error analyzing slide: {e}")
+            return None, []
+    
+    def _extract_background(self, root) -> Optional[Dict]:
+        """Extract background information."""
+        bg = root.find('.//p:bg', NS)
+        if bg is not None:
+            solid_fill = bg.find('.//a:solidFill/a:srgbClr', NS)
+            if solid_fill is not None:
+                color = solid_fill.get('val', 'FFFFFF')
+                return {'color': color}
+        return None
+    
+    def _extract_shapes(self, root) -> List[SlideElement]:
+        """Extract all shapes from slide."""
+        shapes = root.findall('.//p:sp', NS)
+        elements = []
+        
+        for shape in shapes:
+            # Get position and size
+            position = self._get_position_and_size(shape)
+            if not position:
+                continue
+            
+            # Get text content
+            text_content = self._get_text_content(shape)
+            
+            # Get text formatting
+            text_format = self._get_text_format(shape)
+            
+            # Get fill color
+            fill_color = self._get_fill_color(shape)
+            
+            # Get shape type
+            shape_type = self._get_shape_type(shape)
+            
+            if text_content:
+                # This is a text element
+                props = {**position, **text_format, 'text': text_content}
+                elements.append(SlideElement('text', props))
+            elif fill_color or shape_type:
+                # This is a shape element
+                props = {**position, 'fillColor': fill_color, 'shapeType': shape_type}
+                elements.append(SlideElement('shape', props))
+        
+        return elements
+    
+    def _extract_images(self, root) -> List[SlideElement]:
+        """Extract all images from slide."""
+        pics = root.findall('.//p:pic', NS)
+        elements = []
+        
+        for idx, pic in enumerate(pics, 1):
+            position = self._get_position_and_size(pic)
+            if position:
+                position['index'] = idx
+                elements.append(SlideElement('image', position))
+        
+        return elements
+    
+    def _get_position_and_size(self, element) -> Optional[Dict]:
+        """Extract position and size from element."""
+        xfrm = element.find('.//a:xfrm', NS)
+        if xfrm is not None:
+            off = xfrm.find('a:off', NS)
+            ext = xfrm.find('a:ext', NS)
+            if off is not None and ext is not None:
+                x_emu = int(off.get('x', 0))
+                y_emu = int(off.get('y', 0))
+                w_emu = int(ext.get('cx', 0))
+                h_emu = int(ext.get('cy', 0))
+                
+                return {
+                    'x': x_emu / EMU_TO_INCH,
+                    'y': y_emu / EMU_TO_INCH,
+                    'w': w_emu / EMU_TO_INCH,
+                    'h': h_emu / EMU_TO_INCH
+                }
+        return None
+    
+    def _get_text_content(self, element) -> str:
+        """Extract text content from element."""
+        text_elements = element.findall('.//a:t', NS)
+        if text_elements:
+            text_parts = [t.text for t in text_elements if t.text]
+            return ' '.join(text_parts)
+        return ""
+    
+    def _get_text_format(self, element) -> Dict:
+        """Extract text formatting."""
+        format_dict = {}
+        
+        rpr = element.find('.//a:rPr', NS)
+        if rpr is not None:
+            # Font size (in 100th of a point)
+            font_size = rpr.get('sz')
+            if font_size:
+                format_dict['fontSize'] = int(font_size) / 100
+            
+            # Bold
+            if rpr.get('b') == '1':
+                format_dict['bold'] = True
+            
+            # Italic
+            if rpr.get('i') == '1':
+                format_dict['italic'] = True
+            
+            # Font color
+            font_color = rpr.find('.//a:srgbClr', NS)
+            if font_color is not None:
+                color = font_color.get('val', '000000')
+                format_dict['color'] = color
+            
+            # Font face
+            latin = rpr.find('.//a:latin', NS)
+            if latin is not None:
+                font_face = latin.get('typeface')
+                if font_face:
+                    format_dict['fontFace'] = font_face
+        
+        # Alignment
+        ppr = element.find('.//a:pPr', NS)
+        if ppr is not None:
+            algn = ppr.get('algn')
+            if algn == 'ctr':
+                format_dict['align'] = 'center'
+            elif algn == 'r':
+                format_dict['align'] = 'right'
+            else:
+                format_dict['align'] = 'left'
+        
+        return format_dict
+    
+    def _get_fill_color(self, element) -> Optional[str]:
+        """Extract fill color from shape."""
+        solid_fill = element.find('.//a:solidFill/a:srgbClr', NS)
+        if solid_fill is not None:
+            return solid_fill.get('val', 'FFFFFF')
+        return None
+    
+    def _get_shape_type(self, element) -> str:
+        """Extract shape type."""
+        prst_geom = element.find('.//a:prstGeom', NS)
+        if prst_geom is not None:
+            shape_type = prst_geom.get('prst', 'rect')
+            # Map to PptxGenJS shape types
+            if shape_type == 'rect':
+                return 'RECTANGLE'
+            elif shape_type == 'ellipse':
+                return 'OVAL'
+            elif shape_type == 'roundRect':
+                return 'ROUNDED_RECTANGLE'
+        return 'RECTANGLE'
+
+
+def generate_pptxgenjs_code(background: Optional[Dict], elements: List[SlideElement], 
+                            slide_number: int, filename: str, pptx_path: str = None) -> Tuple[str, List[str]]:
+    """Generate complete PptxGenJS code for a slide and return list of image files to extract."""
+    
+    # Clean filename for use in paths
+    base_filename = filename.replace('.pptx', '').replace(' ', '_')
+    
+    code = f"""// Generated code for Slide {slide_number} from {filename}
+// IMPORTANT: This code expects an 'images/' folder in the same directory
+// All referenced images should be placed in the images/ folder
+
+const pptxgen = require("pptxgenjs");
+
+let pres = new pptxgen();
+pres.layout = 'LAYOUT_16x9';  // Standard widescreen
+pres.author = 'Generated by PPT2Code';
+pres.title = 'Converted Presentation';
+
+let slide = pres.addSlide();
+"""
+    
+    # Add background
+    if background and 'color' in background:
+        code += f"\n// Background\nslide.background = {{ color: \"{background['color']}\" }};\n"
+    
+    # Collect image names for extraction
+    image_files = []
+    
+    # Add all elements
+    code += "\n// Slide Elements\n"
+    for idx, element in enumerate(elements, 1):
+        code += f"\n// Element {idx}\n"
+        code += element.to_pptxgenjs(slide_number, filename)
+        code += "\n"
+        
+        # Track image files that need to be extracted
+        if element.element_type == 'image':
+            image_name = f"{base_filename}_slide{slide_number}_img{element.properties.get('index', 1)}.png"
+            image_files.append(image_name)
+    
+    # Add save command
+    code += f"""
+// Save the presentation
+pres.writeFile({{ fileName: "{base_filename}_slide_{slide_number}_recreated.pptx" }});
+
+console.log("✅ Slide {slide_number} recreated successfully!");
+"""
+    
+    # Add instructions if images are present
+    if image_files:
+        code += f"""
+console.log("📋 Required images (place in images/ folder):");
+"""
+        for img in image_files:
+            code += f"""console.log("   - images/{img}");\n"""
+    
+    return code, image_files
+
+
+def main():
+    """Main Streamlit application."""
+    
+    st.set_page_config(
+        page_title="PowerPoint to PptxGenJS Converter",
+        page_icon="📊",
+        layout="wide"
+    )
+    
+    st.title("📊 PowerPoint to PptxGenJS Code Converter")
+    st.markdown("""
+    Upload PowerPoint files and convert specific slides to PptxGenJS JavaScript code.
+    
+    **How to use:**
+    1. Upload up to 5 PowerPoint files
+    2. Select a file from the list
+    3. Choose a slide number
+    4. Get the generated PptxGenJS code!
+    """)
+    
+    # File upload
+    st.sidebar.header("📁 Upload PowerPoint Files")
+    uploaded_files = st.sidebar.file_uploader(
+        "Choose PowerPoint files (.pptx)",
+        type=['pptx'],
+        accept_multiple_files=True,
+        help="Upload up to 5 PowerPoint files"
+    )
+    
+    if not uploaded_files:
+        st.info("👆 Please upload PowerPoint files using the sidebar")
+        return
+    
+    if len(uploaded_files) > 5:
+        st.warning("⚠️ Maximum 5 files allowed. Using first 5 files.")
+        uploaded_files = uploaded_files[:5]
+    
+    # Store uploaded files temporarily
+    temp_dir = Path(tempfile.mkdtemp())
+    file_paths = {}
+    
+    for uploaded_file in uploaded_files:
+        temp_path = temp_dir / uploaded_file.name
+        with open(temp_path, 'wb') as f:
+            f.write(uploaded_file.getbuffer())
+        file_paths[uploaded_file.name] = str(temp_path)
+    
+    # Display uploaded files
+    st.sidebar.success(f"✅ {len(uploaded_files)} file(s) uploaded")
+    
+    # File selection
+    st.header("1️⃣ Select PowerPoint File")
+    selected_file = st.selectbox(
+        "Choose a file to analyze:",
+        options=list(file_paths.keys())
+    )
+    
+    if not selected_file:
+        return
+    
+    # Analyze selected file
+    analyzer = PPTXAnalyzer(file_paths[selected_file])
+    total_slides = analyzer.get_slide_count()
+    
+    if total_slides == 0:
+        st.error("❌ Could not read slides from this file")
+        return
+    
+    st.success(f"📄 **{selected_file}** contains **{total_slides}** slide(s)")
+    
+    # Slide number selection
+    st.header("2️⃣ Select Slide Number")
+    
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        slide_number = st.number_input(
+            "Slide number:",
+            min_value=1,
+            max_value=total_slides,
+            value=1,
+            step=1
+        )
+    
+    with col2:
+        st.info(f"ℹ️ Selected: Slide {slide_number} of {total_slides}")
+    
+    # Analyze button
+    if st.button("🔍 Analyze & Generate Code", type="primary"):
+        with st.spinner("Analyzing slide and extracting images..."):
+            background, elements = analyzer.analyze_slide(slide_number)
+            
+            if not elements:
+                st.warning("⚠️ No elements found in this slide")
+                return
+            
+            # Create images directory in temp folder
+            images_dir = temp_dir / "images"
+            images_dir.mkdir(exist_ok=True)
+            
+            # Extract images from the slide
+            base_filename = selected_file.replace('.pptx', '').replace(' ', '_')
+            extracted_images = analyzer.extract_images(
+                slide_number, 
+                str(images_dir), 
+                base_filename
+            )
+            
+            # Generate code
+            code, image_files = generate_pptxgenjs_code(
+                background, elements, slide_number, selected_file, 
+                file_paths[selected_file]
+            )
+            
+            # Display results
+            st.header("3️⃣ Generated PptxGenJS Code")
+            
+            # Statistics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Elements", len(elements))
+            with col2:
+                text_count = sum(1 for e in elements if e.element_type == 'text')
+                st.metric("Text Elements", text_count)
+            with col3:
+                image_count = sum(1 for e in elements if e.element_type == 'image')
+                st.metric("Images", image_count)
+            with col4:
+                st.metric("Images Extracted", len(extracted_images))
+            
+            # Image extraction status
+            if extracted_images:
+                st.success(f"✅ {len(extracted_images)} image(s) extracted to images/ folder")
+                with st.expander("📁 Extracted Image Files"):
+                    for img in extracted_images:
+                        st.text(f"  ✓ images/{img}")
+            
+            # Code display
+            st.code(code, language='javascript', line_numbers=True)
+            
+            # Download buttons
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.download_button(
+                    label="💾 Download JavaScript Code",
+                    data=code,
+                    file_name=f"{base_filename}_slide_{slide_number}.js",
+                    mime="text/javascript"
+                )
+            
+            with col2:
+                if extracted_images:
+                    # Create a zip file with code and images
+                    import io
+                    import zipfile as zf
+                    
+                    zip_buffer = io.BytesIO()
+                    with zf.ZipFile(zip_buffer, 'w', zf.ZIP_DEFLATED) as zip_file:
+                        # Add JavaScript code
+                        zip_file.writestr(
+                            f"{base_filename}_slide_{slide_number}.js",
+                            code
+                        )
+                        
+                        # Add all extracted images
+                        for img_name in extracted_images:
+                            img_path = images_dir / img_name
+                            if img_path.exists():
+                                zip_file.write(
+                                    img_path,
+                                    f"images/{img_name}"
+                                )
+                    
+                    zip_buffer.seek(0)
+                    st.download_button(
+                        label="📦 Download Complete Package (Code + Images)",
+                        data=zip_buffer,
+                        file_name=f"{base_filename}_slide_{slide_number}_package.zip",
+                        mime="application/zip"
+                    )
+            
+            # Element details
+            with st.expander("📋 View Element Details"):
+                for idx, element in enumerate(elements, 1):
+                    st.markdown(f"**Element {idx}** - Type: `{element.element_type}`")
+                    st.json(element.properties)
+                    st.divider()
+            
+            # Instructions
+            with st.expander("📝 How to Use Generated Code"):
+                st.markdown(f"""
+                ### Setup
+                ```bash
+                npm install -g pptxgenjs
+                ```
+                
+                ### File Structure
+                After downloading, your folder should look like:
+                ```
+                your-project/
+                ├── {base_filename}_slide_{slide_number}.js
+                └── images/
+                    ├── {base_filename}_slide{slide_number}_img1.png
+                    ├── {base_filename}_slide{slide_number}_img2.png
+                    └── ... (all extracted images)
+                ```
+                
+                ### Run the Code
+                ```bash
+                # Method 1: Download complete package (recommended)
+                # Unzip the package - it includes code + images folder
+                unzip {base_filename}_slide_{slide_number}_package.zip
+                cd {base_filename}_slide_{slide_number}_package
+                node {base_filename}_slide_{slide_number}.js
+                
+                # Method 2: Download code only
+                # Create 'images' folder and place extracted images there
+                node {base_filename}_slide_{slide_number}.js
+                ```
+                
+                ### Output
+                - Generated file: `{base_filename}_slide_{slide_number}_recreated.pptx`
+                
+                ### Notes
+                - All images are automatically extracted and included
+                - Image names are unique: `filename_slideN_imgN.extension`
+                - If images are missing, you'll see an error when running
+                - Some complex formatting may need manual adjustment
+                """)
+    
+    # Cleanup
+    try:
+        shutil.rmtree(temp_dir)
+    except:
+        pass
+
+
+if __name__ == "__main__":
+    main()

@@ -74,23 +74,28 @@ class SlideElement:
     def _generate_shape_code(self) -> str:
         """Generate shape element code."""
         props = self.properties
-        
+
         shape_type = props.get('shapeType', 'RECTANGLE')
-        
+
         options = []
         options.append(f"  x: {props.get('x', 0):.2f}, y: {props.get('y', 0):.2f}")
         options.append(f"  w: {props.get('w', 1):.2f}, h: {props.get('h', 1):.2f}")
-        
-        if 'fillColor' in props:
-            options.append(f"  fill: {{ color: \"{props['fillColor']}\" }}")
-        if 'lineColor' in props:
+
+        # Only add fill color if it exists and is not None
+        fill_color = props.get('fillColor')
+        if fill_color and fill_color is not None:
+            options.append(f"  fill: {{ color: \"{fill_color}\" }}")
+
+        # Only add line color if it exists and is not None
+        line_color = props.get('lineColor')
+        if line_color and line_color is not None:
             line_width = props.get('lineWidth', 1)
-            options.append(f"  line: {{ color: \"{props['lineColor']}\", width: {line_width} }}")
-        
+            options.append(f"  line: {{ color: \"{line_color}\", width: {line_width} }}")
+
         code = f"slide.addShape(pres.shapes.{shape_type}, {{\n"
         code += ",\n".join(options)
         code += "\n});"
-        
+
         return code
     
     def _generate_image_code(self, slide_number: int = 1, filename: str = "presentation") -> str:
@@ -260,10 +265,14 @@ class PPTXAnalyzer:
                 # This is a text element
                 props = {**position, **text_format, 'text': text_content}
                 elements.append(SlideElement('text', props))
-            elif fill_color or shape_type:
-                # This is a shape element
-                props = {**position, 'fillColor': fill_color, 'shapeType': shape_type}
-                elements.append(SlideElement('shape', props))
+            else:
+                # This is a shape element - only add fillColor if it's not None
+                props = {**position, 'shapeType': shape_type}
+                if fill_color is not None:
+                    props['fillColor'] = fill_color
+                # Only create shape element if it has meaningful properties
+                if fill_color is not None or shape_type:
+                    elements.append(SlideElement('shape', props))
         
         return elements
     
@@ -355,10 +364,51 @@ class PPTXAnalyzer:
     
     def _get_fill_color(self, element) -> Optional[str]:
         """Extract fill color from shape."""
-        solid_fill = element.find('.//a:solidFill/a:srgbClr', NS)
-        if solid_fill is not None:
-            return solid_fill.get('val', 'FFFFFF')
+        # Check for explicit RGB color in spPr
+        srgb = element.find('.//p:spPr/a:solidFill/a:srgbClr', NS)
+        if srgb is not None:
+            return srgb.get('val', 'FFFFFF')
+
+        # Check for explicit scheme color in spPr
+        scheme = element.find('.//p:spPr/a:solidFill/a:schemeClr', NS)
+        if scheme is not None:
+            scheme_val = scheme.get('val')
+            return self._resolve_scheme_color(scheme_val)
+
+        # Check for system color in spPr
+        sys_clr = element.find('.//p:spPr/a:solidFill/a:sysClr', NS)
+        if sys_clr is not None:
+            last_clr = sys_clr.get('lastClr')
+            if last_clr:
+                return last_clr
+
+        # Check for style reference (fillRef)
+        fill_ref = element.find('.//p:style/a:fillRef/a:schemeClr', NS)
+        if fill_ref is not None:
+            scheme_val = fill_ref.get('val')
+            return self._resolve_scheme_color(scheme_val)
+
         return None
+
+    def _resolve_scheme_color(self, scheme_val: str) -> str:
+        """Map scheme color names to approximate RGB values."""
+        scheme_colors = {
+            'accent1': '4472C4',  # Blue
+            'accent2': 'ED7D31',  # Orange
+            'accent3': 'A5A5A5',  # Gray
+            'accent4': 'FFC000',  # Yellow
+            'accent5': '5B9BD5',  # Light Blue
+            'accent6': '70AD47',  # Green
+            'bg1': 'FFFFFF',      # Background 1 (white)
+            'bg2': 'E7E6E6',      # Background 2 (light gray)
+            'tx1': '000000',      # Text 1 (black)
+            'tx2': '44546A',      # Text 2 (dark gray)
+            'lt1': 'FFFFFF',      # Light 1
+            'lt2': 'E7E6E6',      # Light 2
+            'dk1': '000000',      # Dark 1
+            'dk2': '44546A',      # Dark 2
+        }
+        return scheme_colors.get(scheme_val, '4472C4')  # Default to accent1 blue
     
     def _get_shape_type(self, element) -> str:
         """Extract shape type."""
